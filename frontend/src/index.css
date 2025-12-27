@@ -1,0 +1,73 @@
+:root {
+  /* Odoo Color Palette */
+  --odoo-primary: #875A7B;
+  --odoo-primary-dark: #6B4C5F;
+  --odoo-primary-light: #A67A9A;
+  --odoo-secondary: #7C7BAD;
+  --odoo-success: #28A745;
+  --odoo-danger: #DC3545;
+  --odoo-warning: #FFC107;
+  --odoo-info: #17A2B8;
+  
+  /* Neutral Colors */
+  --odoo-bg: #F8F9FA;
+  --odoo-bg-white: #FFFFFF;
+  --odoo-text: #212529;
+  --odoo-text-muted: #6C757D;
+  --odoo-border: #DEE2E6;
+  --odoo-border-light: #E9ECEF;
+  --odoo-hover: #F1F3F5;
+  
+  /* Shadows */
+  --odoo-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --odoo-shadow: 0 2px 4px rgba(0, 0, 0, 0.08);
+  --odoo-shadow-md: 0 4px 6px rgba(0, 0, 0, 0.1);
+  --odoo-shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.1);
+  
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  line-height: 1.6;
+  font-weight: 400;
+  color: var(--odoo-text);
+  background-color: var(--odoo-bg);
+  
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background-color: var(--odoo-bg);
+}
+
+a {
+  color: var(--odoo-primary);
+  text-decoration: none;
+  transition: color 0.2s ease;
+}
+a:hover {
+  color: var(--odoo-primary-dark);
+}
+
+h1, h2, h3, h4, h5, h6 {
+  margin: 0 0 0.5rem 0;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--odoo-text);
+}
+
+h1 { font-size: 2rem; }
+h2 { font-size: 1.75rem; }
+h3 { font-size: 1.5rem; }
+h4 { font-size: 1.25rem; }
+h5 { font-size: 1.1rem; }
+h6 { font-size: 1rem; }
