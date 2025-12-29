@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { apiGet, apiPost, apiPut } from "../api.js";
 import { getUser } from "../auth.js";
+import { hasPermission } from "../permissions.js";
 
 export default function Requests() {
   const [user, setUser] = useState(null);
@@ -182,17 +183,24 @@ export default function Requests() {
       <div className="topbar">
         <h2 className="topbar-title">Maintenance Requests</h2>
         <div className="topbar-actions">
-          <button className="btn" onClick={() => setShowWorksheet(s => !s)}>Worksheet</button>
-          <button className="btn btn-primary" onClick={resetForm}>New Request</button>
+          {hasPermission(user, 'add_worksheet') && (
+            <button className="btn" onClick={() => setShowWorksheet(s => !s)}>Worksheet</button>
+          )}
+          {hasPermission(user, 'create_request') && (
+            <button className="btn btn-primary" onClick={resetForm}>New Request</button>
+          )}
         </div>
       </div>
 
       <div className="content-wrapper">
-        <div className="stagebar">
-          <span className="badge">{stageText}</span>
-          <span className="badge">{blockText}</span>
-        </div>
+        {(hasPermission(user, 'update_request_stage') || hasPermission(user, 'create_request')) && (
+          <div className="stagebar">
+            <span className="badge">{stageText}</span>
+            <span className="badge">{blockText}</span>
+          </div>
+        )}
 
+      {(hasPermission(user, 'create_request') || currentId) && (
       <div className="row" style={{ marginBottom: "2rem" }}>
         <div className="col">
           <div className="card" style={{ padding: "1.5rem" }}>
@@ -298,27 +306,38 @@ export default function Requests() {
             <input className="input" value="My Company" disabled />
           </div>
 
-          <div className="field">
-            <div className="label">Stage</div>
-            <select value={form.stage} onChange={(e) => setVal("stage", e.target.value)}>
-              <option value="NEW_REQUEST">New Request</option>
-              <option value="IN_PROGRESS">In Progress</option>
-              <option value="REPAIRED">Repaired</option>
-              <option value="SCRAP">Scrap</option>
-            </select>
-          </div>
+          {hasPermission(user, 'update_request_stage') && (
+            <>
+              <div className="field">
+                <div className="label">Stage</div>
+                <select value={form.stage} onChange={(e) => setVal("stage", e.target.value)}>
+                  <option value="NEW_REQUEST">New Request</option>
+                  <option value="IN_PROGRESS">In Progress</option>
+                  <option value="REPAIRED">Repaired</option>
+                  <option value="SCRAP">Scrap</option>
+                </select>
+              </div>
 
-          <div className="field">
-            <div className="label">Blocked?</div>
-            <select value={form.blocked} onChange={(e) => setVal("blocked", e.target.value)}>
-              <option value={0}>No</option>
-              <option value={1}>Yes</option>
-            </select>
-          </div>
+              <div className="field">
+                <div className="label">Blocked?</div>
+                <select value={form.blocked} onChange={(e) => setVal("blocked", e.target.value)}>
+                  <option value={0}>No</option>
+                  <option value={1}>Yes</option>
+                </select>
+              </div>
+            </>
+          )}
 
           <div className="right" style={{ marginTop: "1rem" }}>
-            <button className="btn btn-primary" onClick={saveNew}>Save</button>{" "}
-            <button className="btn" onClick={updateStage}>Update Stage</button>
+            {hasPermission(user, 'create_request') && (
+              <button className="btn btn-primary" onClick={saveNew}>Save</button>
+            )}
+            {hasPermission(user, 'update_request_stage') && (
+              <>
+                {" "}
+                <button className="btn" onClick={updateStage}>Update Stage</button>
+              </>
+            )}
           </div>
 
           {err && <div className="error" style={{ marginTop: "1rem" }}>{err}</div>}
@@ -326,10 +345,15 @@ export default function Requests() {
           </div>
         </div>
       </div>
+      )}
 
         <div className="tabs">
-          <button className={"tabbtn " + (tab === "notes" ? "active" : "")} onClick={() => setTab("notes")}>Notes</button>
-          <button className={"tabbtn " + (tab === "instructions" ? "active" : "")} onClick={() => setTab("instructions")}>Instructions</button>
+          {hasPermission(user, 'add_notes') && (
+            <button className={"tabbtn " + (tab === "notes" ? "active" : "")} onClick={() => setTab("notes")}>Notes</button>
+          )}
+          {hasPermission(user, 'add_instructions') && (
+            <button className={"tabbtn " + (tab === "instructions" ? "active" : "")} onClick={() => setTab("instructions")}>Instructions</button>
+          )}
         </div>
 
         <div style={{ padding: "1rem 0" }}>

@@ -14,6 +14,21 @@ const supabase = createClient(
   process.env.SUPABASE_ANON_KEY
 );
 
+// Initialize Supabase admin client (with service role key if available)
+// This bypasses RLS and should be used for server-side operations
+const supabaseAdmin = process.env.SUPABASE_SERVICE_ROLE_KEY
+  ? createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_ROLE_KEY,
+      {
+        auth: {
+          autoRefreshToken: false,
+          persistSession: false
+        }
+      }
+    )
+  : null;
+
 // Middleware
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:5173',
@@ -35,6 +50,126 @@ async function getUserFromRequest(req) {
   return user;
 }
 
+// Helper function to get user profile with role
+async function getUserProfile(req) {
+  const user = await getUserFromRequest(req);
+  if (!user) return null;
+  
+  const { data: profile, error } = await supabase
+    .from('profiles')
+    .select('*')
+    .eq('id', user.id)
+    .single();
+  
+  if (error || !profile) return null;
+  
+  return {
+    ...user,
+    role: profile.role,
+    name: profile.name
+  };
+}
+
+// Permission check functions based on role matrix
+function hasPermission(userProfile, action) {
+  if (!userProfile || !userProfile.role) return false;
+  
+  const role = userProfile.role;
+  
+  // ADMIN has all permissions
+  if (role === 'ADMIN') return true;
+  
+  // Permission matrix
+  const permissions = {
+    'view_all_requests': ['ADMIN', 'MANAGER'],
+    'view_own_requests': ['ADMIN', 'MANAGER', 'TECHNICIAN', 'EMPLOYEE'],
+    'create_request': ['ADMIN', 'MANAGER', 'EMPLOYEE'],
+    'update_request_stage': ['ADMIN', 'MANAGER', 'TECHNICIAN'],
+    'delete_request': ['ADMIN', 'MANAGER'],
+    'add_notes': ['ADMIN', 'MANAGER', 'EMPLOYEE'],
+    'add_instructions': ['ADMIN', 'MANAGER'],
+    'add_worksheet': ['ADMIN'],
+    'manage_equipment': ['ADMIN', 'MANAGER'],
+    'manage_workcenters': ['ADMIN', 'MANAGER'],
+    'manage_teams': ['ADMIN', 'MANAGER'],
+    'change_user_roles': ['ADMIN']
+  };
+  
+  const allowedRoles = permissions[action];
+  return allowedRoles ? allowedRoles.includes(role) : false;
+}
+
+// Middleware to check permissions
+function requirePermission(action) {
+  return async (req, res, next) => {
+    const userProfile = await getUserProfile(req);
+    
+    if (!userProfile) {
+      return res.status(401).json({ message: "Not authenticated" });
+    }
+    
+    if (!hasPermission(userProfile, action)) {
+      return res.status(403).json({ message: "You don't have permission to perform this action" });
+    }
+    
+    req.userProfile = userProfile;
+    next();
+  };
+}
+
+// Middleware to check if user can access own resource or all resources
+function requireRequestAccess() {
+  return async (req, res, next) => {
+    const userProfile = await getUserProfile(req);
+    
+    if (!userProfile) {
+      return res.status(401).json({ message: "Not authenticated" });
+    }
+    
+    // ADMIN and MANAGER can view all
+    if (hasPermission(userProfile, 'view_all_requests')) {
+      req.userProfile = userProfile;
+      req.canViewAll = true;
+      return next();
+    }
+    
+    // Others can only view own
+    if (hasPermission(userProfile, 'view_own_requests')) {
+      req.userProfile = userProfile;
+      req.canViewAll = false;
+      return next();
+    }
+    
+    return res.status(403).json({ message: "You don't have permission to view requests" });
+  };
+}
+
+// Helper function to get authenticated Supabase client with user's token
+function getAuthenticatedClient(req) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return supabase; // Return default client if no auth
+  }
+  
+  const token = authHeader.split('Bearer ')[1];
+  // Create a new client with the user's access token
+  const client = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_ANON_KEY,
+    {
+      global: {
+        headers: {
+          Authorization: `Bearer ${token}`
+        }
+      },
+      auth: {
+        persistSession: false
+      }
+    }
+  );
+  return client;
+}
+
 // =========================================================
 // AUTHENTICATION ROUTES
 // =========================================================
@@ -49,6 +184,63 @@ app.post('/api/auth/login', async (req, res) => {
     });
     
     if (error) {
+      // If user exists but email is not confirmed, try to handle it
+      if (error.message && (
+        error.message.toLowerCase().includes('email not confirmed') ||
+        error.message.toLowerCase().includes('not confirmed') ||
+        error.message.toLowerCase().includes('email_not_confirmed')
+      )) {
+        // If email verification is disabled in Supabase, we can try to confirm the user
+        // using admin client if available
+        if (supabaseAdmin) {
+          try {
+            // Get the user by email using admin client
+            const { data: users, error: listError } = await supabaseAdmin.auth.admin.listUsers();
+            if (!listError && users) {
+              const user = users.users.find(u => u.email === email);
+              if (user && !user.email_confirmed_at) {
+                // Confirm the user
+                await supabaseAdmin.auth.admin.updateUserById(user.id, {
+                  email_confirm: true
+                });
+                // Try login again
+                const { data: retryData, error: retryError } = await supabase.auth.signInWithPassword({
+                  email,
+                  password,
+                });
+                if (!retryError && retryData) {
+                  // Get user profile
+                  const { data: profile, error: profileError } = await supabase
+                    .from('profiles')
+                    .select('*')
+                    .eq('id', retryData.user.id)
+                    .single();
+                  
+                  if (profileError) {
+                    return res.status(400).json({ message: profileError.message });
+                  }
+                  
+                  return res.json({
+                    user: {
+                      id: retryData.user.id,
+                      email: retryData.user.email,
+                      name: profile.name,
+                      role: profile.role
+                    },
+                    session: retryData.session
+                  });
+                }
+              }
+            }
+          } catch (adminError) {
+            console.error('Error confirming user:', adminError);
+          }
+        }
+        return res.status(400).json({ 
+          message: "Your email is not confirmed. Please check your email for a verification link, or contact support."
+        });
+      }
+      
       return res.status(400).json({ message: error.message });
     }
     
@@ -101,24 +293,88 @@ app.post('/api/auth/signup', async (req, res) => {
     });
     
     if (error) {
+      // If user already exists, provide helpful message
+      if (error.message && (
+        error.message.toLowerCase().includes('already registered') ||
+        error.message.toLowerCase().includes('user already registered')
+      )) {
+        // If email verification is disabled, user should be able to login
+        // If admin client is available, try to confirm existing unconfirmed user
+        if (supabaseAdmin) {
+          try {
+            const { data: users, error: listError } = await supabaseAdmin.auth.admin.listUsers();
+            if (!listError && users) {
+              const user = users.users.find(u => u.email === email);
+              if (user && !user.email_confirmed_at) {
+                // Confirm the existing user
+                await supabaseAdmin.auth.admin.updateUserById(user.id, {
+                  email_confirm: true
+                });
+                return res.status(400).json({ 
+                  message: "User already exists. Your account has been activated. Please try logging in."
+                });
+              }
+            }
+          } catch (adminError) {
+            console.error('Error confirming existing user:', adminError);
+          }
+        }
+        
+        return res.status(400).json({ 
+          message: "User already exists. Please try logging in instead."
+        });
+      }
+      
       return res.status(400).json({ message: error.message });
     }
     
     // Update the profile with the role (the trigger creates the profile, but we need to set the role)
     if (data.user) {
-      const { error: profileError } = await supabase
-        .from('profiles')
-        .update({ role: userRole })
-        .eq('id', data.user.id);
+      // Wait a bit for the trigger to create the profile
+      await new Promise(resolve => setTimeout(resolve, 500));
       
-      if (profileError) {
-        console.error('Error updating profile role:', profileError);
-        // Don't fail the signup, just log the error
+      // Always use admin client if available to bypass RLS and ensure role is set correctly
+      if (supabaseAdmin) {
+        const { error: profileError } = await supabaseAdmin
+          .from('profiles')
+          .update({ role: userRole })
+          .eq('id', data.user.id);
+        
+        if (profileError) {
+          console.error('Error updating profile role with admin client:', profileError);
+          return res.status(500).json({ 
+            message: "User created but failed to set role. Please contact support." 
+          });
+        }
+        console.log(`Profile role set to ${userRole} for user ${data.user.id}`);
+      } else {
+        // Fallback to regular client (may fail due to RLS)
+        const { error: profileError } = await supabase
+          .from('profiles')
+          .update({ role: userRole })
+          .eq('id', data.user.id);
+        
+        if (profileError) {
+          console.error('Error updating profile role (admin client not available):', profileError);
+          console.warn('SUPABASE_SERVICE_ROLE_KEY not set. Profile role may default to EMPLOYEE.');
+          console.warn('Please add SUPABASE_SERVICE_ROLE_KEY to .env file to ensure roles are set correctly.');
+        }
+      }
+      
+      // If email verification is disabled and admin client is available, confirm the user immediately
+      if (supabaseAdmin && !data.user.email_confirmed_at) {
+        try {
+          await supabaseAdmin.auth.admin.updateUserById(data.user.id, {
+            email_confirm: true
+          });
+        } catch (confirmError) {
+          console.error('Error confirming new user:', confirmError);
+        }
       }
     }
     
     res.json({ 
-      message: "Signup successful! Please check your email to verify your account.",
+      message: "Signup successful! You can now log in.",
       email: data.user?.email
     });
   } catch (error) {
@@ -314,20 +570,36 @@ app.get('/api/equipment', async (req, res) => {
 
 app.get('/api/equipment/meta', async (req, res) => {
   try {
-    const [categories, departments, locations, teams, users] = await Promise.all([
+    // Use admin client for workcenters if available to bypass RLS, otherwise use authenticated client
+    let workcentersClient = supabaseAdmin;
+    if (!workcentersClient) {
+      workcentersClient = getAuthenticatedClient(req);
+    }
+    if (!workcentersClient) {
+      workcentersClient = supabase;
+    }
+    
+    const [categories, departments, locations, teams, users, workcenters] = await Promise.all([
       supabase.from('equipment_categories').select('id, name').order('name'),
       supabase.from('departments').select('id, name').order('name'),
       supabase.from('locations').select('id, name').order('name'),
       supabase.from('teams').select('id, name').order('name'),
-      supabase.from('profiles').select('id, name, role').order('name')
+      supabase.from('profiles').select('id, name, role').order('name'),
+      workcentersClient.from('workcenters').select('id, name').order('name')
     ]);
+    
+    // Log workcenters query result for debugging
+    if (workcenters.error) {
+      console.error('Error fetching workcenters:', workcenters.error);
+    }
     
     res.json({
       categories: categories.data || [],
       departments: departments.data || [],
       locations: locations.data || [],
       teams: teams.data || [],
-      users: users.data || []
+      users: users.data || [],
+      workcenters: workcenters.data || []
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -352,32 +624,48 @@ app.get('/api/equipment/:id', async (req, res) => {
   }
 });
 
-app.post('/api/equipment', async (req, res) => {
+app.post('/api/equipment', requirePermission('manage_equipment'), async (req, res) => {
   try {
-    const user = await getUserFromRequest(req);
-    if (!user) {
-      return res.status(401).json({ message: "Not authenticated" });
+    const usedByType = req.body.used_by_type || 'EMPLOYEE';
+    const usedByUserId = req.body.used_by_user_id || null;
+    const usedByDepartmentId = req.body.used_by_department_id || null;
+
+    // Validate used_by constraints to avoid DB check constraint failure
+    if (usedByType === 'EMPLOYEE' && !usedByUserId) {
+      return res.status(400).json({ message: "Employee is required when 'Used By' is Employee" });
     }
+    if (usedByType === 'DEPARTMENT' && !usedByDepartmentId) {
+      return res.status(400).json({ message: "Department is required when 'Used By' is Department" });
+    }
+
+    // Build insert object, only including workcenter_id if the column exists
+    const insertData = {
+      name: req.body.name,
+      serial_number: req.body.serial_number || null,
+      category_id: req.body.category_id || null,
+      used_by_type: usedByType,
+      used_by_user_id: usedByType === 'EMPLOYEE' ? usedByUserId : null,
+      used_by_department_id: usedByType === 'DEPARTMENT' ? usedByDepartmentId : null,
+      maintenance_team_id: req.body.maintenance_team_id || null,
+      default_technician_id: req.body.default_technician_id || null,
+      location_id: req.body.location_id || null,
+      assigned_date: req.body.assigned_date || null,
+      scrap_date: req.body.scrap_date || null,
+      purchase_date: req.body.purchase_date || null,
+      warranty_end_date: req.body.warranty_end_date || null,
+      description: req.body.description || null,
+      company: 'My Company'
+    };
+    
+    // Only add workcenter_id if provided (column may not exist in schema)
+    // Uncomment the line below after adding workcenter_id column to equipment table
+    // if (req.body.workcenter_id) {
+    //   insertData.workcenter_id = req.body.workcenter_id;
+    // }
     
     const { data, error } = await supabase
       .from('equipment')
-      .insert({
-        name: req.body.name,
-        serial_number: req.body.serial_number || null,
-        category_id: req.body.category_id || null,
-        used_by_type: req.body.used_by_type || 'EMPLOYEE',
-        used_by_user_id: req.body.used_by_user_id || null,
-        used_by_department_id: req.body.used_by_department_id || null,
-        maintenance_team_id: req.body.maintenance_team_id || null,
-        default_technician_id: req.body.default_technician_id || null,
-        location_id: req.body.location_id || null,
-        assigned_date: req.body.assigned_date || null,
-        scrap_date: req.body.scrap_date || null,
-        purchase_date: req.body.purchase_date || null,
-        warranty_end_date: req.body.warranty_end_date || null,
-        description: req.body.description || null,
-        company: 'My Company'
-      })
+      .insert(insertData)
       .select()
       .single();
     
@@ -391,11 +679,30 @@ app.post('/api/equipment', async (req, res) => {
   }
 });
 
-app.put('/api/equipment/:id', async (req, res) => {
+app.put('/api/equipment/:id', requirePermission('manage_equipment'), async (req, res) => {
   try {
+    const usedByType = req.body.used_by_type || 'EMPLOYEE';
+    const usedByUserId = req.body.used_by_user_id || null;
+    const usedByDepartmentId = req.body.used_by_department_id || null;
+
+    // Validate used_by constraints to avoid DB check constraint failure
+    if (usedByType === 'EMPLOYEE' && !usedByUserId) {
+      return res.status(400).json({ message: "Employee is required when 'Used By' is Employee" });
+    }
+    if (usedByType === 'DEPARTMENT' && !usedByDepartmentId) {
+      return res.status(400).json({ message: "Department is required when 'Used By' is Department" });
+    }
+
+    // Remove workcenter_id until the column is added to the equipment table
+    const updateData = { ...req.body };
+    delete updateData.workcenter_id;
+    updateData.used_by_type = usedByType;
+    updateData.used_by_user_id = usedByType === 'EMPLOYEE' ? usedByUserId : null;
+    updateData.used_by_department_id = usedByType === 'DEPARTMENT' ? usedByDepartmentId : null;
+    
     const { data, error } = await supabase
       .from('equipment')
-      .update(req.body)
+      .update(updateData)
       .eq('id', req.params.id)
       .select()
       .single();
@@ -410,7 +717,7 @@ app.put('/api/equipment/:id', async (req, res) => {
   }
 });
 
-app.delete('/api/equipment/:id', async (req, res) => {
+app.delete('/api/equipment/:id', requirePermission('manage_equipment'), async (req, res) => {
   try {
     const { error } = await supabase
       .from('equipment')
@@ -431,9 +738,9 @@ app.delete('/api/equipment/:id', async (req, res) => {
 // MAINTENANCE REQUESTS ROUTES
 // =========================================================
 
-app.get('/api/requests', async (req, res) => {
+app.get('/api/requests', requireRequestAccess(), async (req, res) => {
   try {
-    const { data: requests, error } = await supabase
+    let query = supabase
       .from('maintenance_requests')
       .select(`
         *,
@@ -443,14 +750,25 @@ app.get('/api/requests', async (req, res) => {
         category:equipment_categories(name),
         technician:profiles(id, name),
         team:teams(name)
-      `)
-      .order('created_at', { ascending: false });
+      `);
+    
+    // Filter by user if they can't view all
+    if (!req.canViewAll) {
+      // TECHNICIAN can only see assigned requests, EMPLOYEE can only see own requests
+      if (req.userProfile.role === 'TECHNICIAN') {
+        query = query.eq('technician_id', req.userProfile.id);
+      } else if (req.userProfile.role === 'EMPLOYEE') {
+        query = query.eq('created_by_user_id', req.userProfile.id);
+      }
+    }
+    
+    const { data: requests, error } = await query.order('created_at', { ascending: false });
     
     if (error) {
       return res.status(400).json({ message: error.message });
     }
     
-    const formatted = requests.map(req => ({
+    const formatted = (requests || []).map(req => ({
       id: req.id,
       subject: req.subject,
       scheduled_at: req.scheduled_at,
@@ -491,9 +809,31 @@ app.get('/api/requests/meta', async (req, res) => {
   }
 });
 
-app.get('/api/requests/:id/details', async (req, res) => {
+app.get('/api/requests/:id/details', requireRequestAccess(), async (req, res) => {
   try {
     const id = req.params.id;
+    const userProfile = req.userProfile;
+    
+    // Check if user can access this request
+    const { data: requestData, error: requestError } = await supabase
+      .from('maintenance_requests')
+      .select('created_by_user_id, technician_id')
+      .eq('id', id)
+      .single();
+    
+    if (requestError) {
+      return res.status(400).json({ message: requestError.message });
+    }
+    
+    // Check access permissions
+    if (!req.canViewAll) {
+      if (userProfile.role === 'TECHNICIAN' && requestData.technician_id !== userProfile.id) {
+        return res.status(403).json({ message: "You can only view requests assigned to you" });
+      }
+      if (userProfile.role === 'EMPLOYEE' && requestData.created_by_user_id !== userProfile.id) {
+        return res.status(403).json({ message: "You can only view your own requests" });
+      }
+    }
     
     const [request, notes, instructions, worksheet] = await Promise.all([
       supabase
@@ -556,12 +896,8 @@ app.get('/api/requests/:id/details', async (req, res) => {
   }
 });
 
-app.post('/api/requests', async (req, res) => {
+app.post('/api/requests', requirePermission('create_request'), async (req, res) => {
   try {
-    const user = await getUserFromRequest(req);
-    if (!user) {
-      return res.status(401).json({ message: "Not authenticated" });
-    }
     
     let scheduledAt = req.body.scheduled_at;
     if (scheduledAt && !scheduledAt.includes('T')) {
@@ -572,7 +908,7 @@ app.post('/api/requests', async (req, res) => {
       .from('maintenance_requests')
       .insert({
         subject: req.body.subject,
-        created_by_user_id: req.body.created_by_user_id || user.id,
+        created_by_user_id: req.body.created_by_user_id || req.userProfile.id,
         maintenance_for: req.body.maintenance_for || 'EQUIPMENT',
         equipment_id: req.body.equipment_id || null,
         workcenter_id: req.body.workcenter_id || null,
@@ -601,9 +937,23 @@ app.post('/api/requests', async (req, res) => {
   }
 });
 
-app.put('/api/requests/:id/stage', async (req, res) => {
+app.put('/api/requests/:id/stage', requirePermission('update_request_stage'), async (req, res) => {
   try {
     const id = req.params.id;
+    const userProfile = req.userProfile;
+    
+    // Check if TECHNICIAN can only update assigned requests
+    if (userProfile.role === 'TECHNICIAN') {
+      const { data: request } = await supabase
+        .from('maintenance_requests')
+        .select('technician_id')
+        .eq('id', id)
+        .single();
+      
+      if (!request || request.technician_id !== userProfile.id) {
+        return res.status(403).json({ message: "You can only update requests assigned to you" });
+      }
+    }
     
     const { data: current } = await supabase
       .from('maintenance_requests')
@@ -626,15 +976,12 @@ app.put('/api/requests/:id/stage', async (req, res) => {
     }
     
     // Record stage history
-    const user = await getUserFromRequest(req);
-    if (user) {
-      await supabase.from('request_stage_history').insert({
-        request_id: parseInt(id),
-        from_stage: current?.stage || null,
-        to_stage: req.body.stage,
-        changed_by_user_id: user.id
-      });
-    }
+    await supabase.from('request_stage_history').insert({
+      request_id: parseInt(id),
+      from_stage: current?.stage || null,
+      to_stage: req.body.stage,
+      changed_by_user_id: userProfile.id
+    });
     
     res.json({ message: "Stage updated", data });
   } catch (error) {
@@ -642,20 +989,30 @@ app.put('/api/requests/:id/stage', async (req, res) => {
   }
 });
 
-app.post('/api/requests/:id/notes', async (req, res) => {
+app.post('/api/requests/:id/notes', requirePermission('add_notes'), async (req, res) => {
   try {
-    const user = await getUserFromRequest(req);
-    if (!user) {
-      return res.status(401).json({ message: "Not authenticated" });
+    const id = req.params.id;
+    const userProfile = req.userProfile;
+    
+    // EMPLOYEE can only add notes to their own requests
+    if (userProfile.role === 'EMPLOYEE') {
+      const { data: request } = await supabase
+        .from('maintenance_requests')
+        .select('created_by_user_id')
+        .eq('id', id)
+        .single();
+      
+      if (!request || request.created_by_user_id !== userProfile.id) {
+        return res.status(403).json({ message: "You can only add notes to your own requests" });
+      }
     }
     
-    const id = req.params.id;
     const { data, error } = await supabase
       .from('request_notes')
       .insert({
         request_id: parseInt(id),
         note: req.body.note,
-        created_by_user_id: user.id
+        created_by_user_id: userProfile.id
       })
       .select()
       .single();
@@ -670,20 +1027,17 @@ app.post('/api/requests/:id/notes', async (req, res) => {
   }
 });
 
-app.post('/api/requests/:id/instructions', async (req, res) => {
+app.post('/api/requests/:id/instructions', requirePermission('add_instructions'), async (req, res) => {
   try {
-    const user = await getUserFromRequest(req);
-    if (!user) {
-      return res.status(401).json({ message: "Not authenticated" });
-    }
-    
     const id = req.params.id;
+    const userProfile = req.userProfile;
+    
     const { data, error } = await supabase
       .from('request_instructions')
       .insert({
         request_id: parseInt(id),
         instruction: req.body.instruction,
-        created_by_user_id: user.id
+        created_by_user_id: userProfile.id
       })
       .select()
       .single();
@@ -698,20 +1052,17 @@ app.post('/api/requests/:id/instructions', async (req, res) => {
   }
 });
 
-app.post('/api/requests/:id/worksheet', async (req, res) => {
+app.post('/api/requests/:id/worksheet', requirePermission('add_worksheet'), async (req, res) => {
   try {
-    const user = await getUserFromRequest(req);
-    if (!user) {
-      return res.status(401).json({ message: "Not authenticated" });
-    }
-    
     const id = req.params.id;
+    const userProfile = req.userProfile;
+    
     const { data, error } = await supabase
       .from('request_worksheet_comments')
       .insert({
         request_id: parseInt(id),
         comment: req.body.comment,
-        created_by_user_id: user.id
+        created_by_user_id: userProfile.id
       })
       .select()
       .single();
@@ -726,11 +1077,30 @@ app.post('/api/requests/:id/worksheet', async (req, res) => {
   }
 });
 
+app.delete('/api/requests/:id', requirePermission('delete_request'), async (req, res) => {
+  try {
+    const id = req.params.id;
+    
+    const { error } = await supabase
+      .from('maintenance_requests')
+      .delete()
+      .eq('id', id);
+    
+    if (error) {
+      return res.status(400).json({ message: error.message });
+    }
+    
+    res.json({ message: "Request deleted" });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // =========================================================
 // WORKCENTERS ROUTES
 // =========================================================
 
-app.get('/api/workcenters', async (req, res) => {
+app.get('/api/workcenters', requirePermission('manage_workcenters'), async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('workcenters')
@@ -747,11 +1117,52 @@ app.get('/api/workcenters', async (req, res) => {
   }
 });
 
+app.post('/api/workcenters', requirePermission('manage_workcenters'), async (req, res) => {
+  try {
+    const { name, code, tag, alternative_workcenters, cost_per_hour, capacity, time_efficiency, oee_target } = req.body;
+    
+    if (!name || !name.trim()) {
+      return res.status(400).json({ message: "Work center name is required" });
+    }
+    
+    // Use admin client if available (bypasses RLS), otherwise use authenticated client
+    const dbClient = supabaseAdmin || getAuthenticatedClient(req);
+    
+    const { data: workcenterData, error: workcenterError } = await dbClient
+      .from('workcenters')
+      .insert({
+        name: name.trim(),
+        code: code?.trim() || null,
+        tag: tag?.trim() || null,
+        alternative_workcenters: alternative_workcenters?.trim() || null,
+        cost_per_hour: cost_per_hour ? Number(cost_per_hour) : null,
+        capacity: capacity ? Number(capacity) : null,
+        time_efficiency: time_efficiency ? Number(time_efficiency) : null,
+        oee_target: oee_target ? Number(oee_target) : null
+      })
+      .select();
+    
+    if (workcenterError) {
+      return res.status(400).json({ message: workcenterError.message });
+    }
+    
+    if (!workcenterData || workcenterData.length === 0) {
+      return res.status(400).json({ message: "Failed to create work center" });
+    }
+    
+    const workcenter = workcenterData[0];
+    
+    res.json({ message: "Work center created successfully", data: workcenter });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // =========================================================
 // TEAMS ROUTES
 // =========================================================
 
-app.get('/api/teams', async (req, res) => {
+app.get('/api/teams', requirePermission('manage_teams'), async (req, res) => {
   try {
     const { data: teams, error } = await supabase
       .from('teams')
@@ -778,6 +1189,143 @@ app.get('/api/teams', async (req, res) => {
     }));
     
     res.json(formatted);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+app.get('/api/teams/meta', async (req, res) => {
+  try {
+    const { data: users, error } = await supabase
+      .from('profiles')
+      .select('id, name, role')
+      .order('name');
+    
+    if (error) {
+      return res.status(400).json({ message: error.message });
+    }
+    
+    res.json({
+      users: users || []
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+app.post('/api/teams', requirePermission('manage_teams'), async (req, res) => {
+  try {
+    // Use admin client if available (bypasses RLS), otherwise use authenticated client
+    const dbClient = supabaseAdmin || getAuthenticatedClient(req);
+    
+    const { name, company, member_ids } = req.body;
+    
+    if (!name || !name.trim()) {
+      return res.status(400).json({ message: "Team name is required" });
+    }
+    
+    // Create the team
+    const { data: teamData, error: teamError } = await dbClient
+      .from('teams')
+      .insert({
+        name: name.trim(),
+        company: company || 'My Company'
+      })
+      .select();
+    
+    if (teamError) {
+      return res.status(400).json({ message: teamError.message });
+    }
+    
+    if (!teamData || teamData.length === 0) {
+      return res.status(400).json({ message: "Failed to create team" });
+    }
+    
+    const team = teamData[0];
+    
+    // Add team members if provided
+    if (member_ids && Array.isArray(member_ids) && member_ids.length > 0) {
+      const membersToInsert = member_ids
+        .filter(id => id != null && id !== '' && String(id).trim() !== '') // Remove null, undefined, empty strings
+        .map(user_id => {
+          // user_id is likely a UUID (string) from profiles table
+          const userId = String(user_id).trim();
+          
+          // Validate: must not be empty after trimming
+          if (userId === '') {
+            return null;
+          }
+          
+          return {
+            team_id: team.id,
+            user_id: userId
+          };
+        })
+        .filter(member => member !== null && member.user_id != null); // Remove any null entries
+      
+      if (membersToInsert.length > 0) {
+        const { error: membersError } = await dbClient
+          .from('team_members')
+          .insert(membersToInsert);
+        
+        if (membersError) {
+          // Team was created but members failed - log but don't fail the request
+          console.error('Error adding team members:', membersError);
+          console.error('Members attempted to insert:', membersToInsert);
+        }
+      }
+    }
+    
+    res.json({ message: "Team created successfully", data: team });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// =========================================================
+// USER MANAGEMENT ROUTES
+// =========================================================
+
+app.put('/api/users/:id/role', requirePermission('change_user_roles'), async (req, res) => {
+  try {
+    const userId = req.params.id;
+    const { role } = req.body;
+    
+    // Validate role
+    const validRoles = ['ADMIN', 'MANAGER', 'TECHNICIAN', 'EMPLOYEE'];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({ message: "Invalid role. Must be one of: ADMIN, MANAGER, TECHNICIAN, EMPLOYEE" });
+    }
+    
+    const { data, error } = await supabase
+      .from('profiles')
+      .update({ role })
+      .eq('id', userId)
+      .select()
+      .single();
+    
+    if (error) {
+      return res.status(400).json({ message: error.message });
+    }
+    
+    res.json({ message: "User role updated", data });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+app.get('/api/users', requirePermission('change_user_roles'), async (req, res) => {
+  try {
+    const { data: users, error } = await supabase
+      .from('profiles')
+      .select('id, name, email, role')
+      .order('name');
+    
+    if (error) {
+      return res.status(400).json({ message: error.message });
+    }
+    
+    res.json(users || []);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

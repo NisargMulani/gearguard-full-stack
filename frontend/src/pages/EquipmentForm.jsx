@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { apiDelete, apiGet, apiPost, apiPut } from "../api.js";
+import { getUser } from "../auth.js";
+import { canManageEquipment } from "../permissions.js";
 
 export default function EquipmentForm({ mode }) {
   const nav = useNavigate();
@@ -9,6 +11,15 @@ export default function EquipmentForm({ mode }) {
   const [meta, setMeta] = useState(null);
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
+  const [user, setUser] = useState(null);
+
+  useEffect(() => {
+    async function loadUser() {
+      const u = await getUser();
+      setUser(u);
+    }
+    loadUser();
+  }, []);
 
   const [form, setForm] = useState({
     name: "",
@@ -21,6 +32,7 @@ export default function EquipmentForm({ mode }) {
     default_technician_id: "",
     scrap_date: "",
     location_id: "",
+    workcenter_id: "",
     assigned_date: "",
     purchase_date: "",
     warranty_end_date: "",
@@ -30,17 +42,20 @@ export default function EquipmentForm({ mode }) {
   useEffect(() => {
     (async () => {
       const m = await apiGet("/equipment/meta");
+      console.log("Equipment meta data:", m);
+      console.log("Workcenters:", m?.workcenters);
       setMeta(m);
 
       // Defaults
       if (m.categories?.[0]) setForm(f => ({ ...f, category_id: String(m.categories[0].id) }));
       if (m.teams?.[0]) setForm(f => ({ ...f, maintenance_team_id: String(m.teams[0].id) }));
-      const emp = (m.users || []).filter(u => ["EMPLOYEE","ADMIN","MANAGER"].includes(u.role));
+      const emp = (m.users || []).filter(u => u.role === "EMPLOYEE");
       const tech = (m.users || []).filter(u => u.role === "TECHNICIAN");
       if (emp?.[0]) setForm(f => ({ ...f, used_by_user_id: String(emp[0].id) }));
       if (tech?.[0]) setForm(f => ({ ...f, default_technician_id: String(tech[0].id) }));
       if (m.departments?.[0]) setForm(f => ({ ...f, used_by_department_id: String(m.departments[0].id) }));
       if (m.locations?.[0]) setForm(f => ({ ...f, location_id: String(m.locations[0].id) }));
+      if (m.workcenters?.[0]) setForm(f => ({ ...f, workcenter_id: String(m.workcenters[0].id) }));
 
       if (mode === "edit" && id) {
         const e = await apiGet(`/equipment/${id}`);
@@ -56,6 +71,7 @@ export default function EquipmentForm({ mode }) {
           default_technician_id: e.default_technician_id ? String(e.default_technician_id) : "",
           scrap_date: e.scrap_date ? e.scrap_date.substring(0, 10) : "",
           location_id: e.location_id ? String(e.location_id) : "",
+          workcenter_id: e.workcenter_id ? String(e.workcenter_id) : "",
           assigned_date: e.assigned_date ? e.assigned_date.substring(0, 10) : "",
           purchase_date: e.purchase_date ? e.purchase_date.substring(0, 10) : "",
           warranty_end_date: e.warranty_end_date ? e.warranty_end_date.substring(0, 10) : "",
@@ -67,7 +83,7 @@ export default function EquipmentForm({ mode }) {
 
   const employees = useMemo(() => {
     if (!meta?.users) return [];
-    return meta.users.filter(u => ["EMPLOYEE","ADMIN","MANAGER"].includes(u.role));
+    return meta.users.filter(u => u.role === "EMPLOYEE");
   }, [meta]);
 
   const techs = useMemo(() => {
@@ -94,6 +110,8 @@ export default function EquipmentForm({ mode }) {
       purchase_date: form.purchase_date || null,
       warranty_end_date: form.warranty_end_date || null,
       location_id: form.location_id ? Number(form.location_id) : null,
+      // workcenter_id is commented out until the column is added to the equipment table
+      // workcenter_id: form.workcenter_id ? Number(form.workcenter_id) : null,
       used_by_type: form.used_by_type,
       used_by_user_id: form.used_by_type === "EMPLOYEE" ? Number(form.used_by_user_id) : null,
       used_by_department_id: form.used_by_type === "DEPARTMENT" ? Number(form.used_by_department_id) : null,
@@ -132,7 +150,9 @@ export default function EquipmentForm({ mode }) {
         <h2 className="topbar-title">{mode === "edit" ? "Edit Equipment" : "New Equipment"}</h2>
         <div className="topbar-actions">
           <button className="btn" onClick={() => nav("/equipment")}>Back</button>
-          {mode === "edit" && <button className="btn btn-danger" onClick={del}>Delete</button>}
+          {mode === "edit" && canManageEquipment(user) && (
+            <button className="btn btn-danger" onClick={del}>Delete</button>
+          )}
         </div>
       </div>
 
@@ -149,6 +169,7 @@ export default function EquipmentForm({ mode }) {
           <div className="field">
             <div className="label">Equipment Category?</div>
             <select value={form.category_id} onChange={(e) => setVal("category_id", e.target.value)}>
+              <option value="">Select category...</option>
               {(meta?.categories || []).map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
             </select>
           </div>
@@ -221,13 +242,17 @@ export default function EquipmentForm({ mode }) {
           <div className="field">
             <div className="label">Used in location?</div>
             <select value={form.location_id} onChange={(e) => setVal("location_id", e.target.value)}>
+              <option value="">Select location...</option>
               {(meta?.locations || []).map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
             </select>
           </div>
 
           <div className="field">
             <div className="label">Work Center?</div>
-            <input className="input" placeholder="optional (link later)" />
+            <select value={form.workcenter_id} onChange={(e) => setVal("workcenter_id", e.target.value)}>
+              <option value="">Select work center...</option>
+              {(meta?.workcenters || []).map(wc => <option key={wc.id} value={wc.id}>{wc.name}</option>)}
+            </select>
           </div>
 
           <div className="field">

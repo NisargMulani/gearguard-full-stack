@@ -1,14 +1,22 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { apiGet } from "../api.js";
+import { getUser } from "../auth.js";
+import { canManageEquipment } from "../permissions.js";
 import Table from "../components/Table.jsx";
 
 export default function EquipmentList() {
   const nav = useNavigate();
   const [rows, setRows] = useState([]);
   const [q, setQ] = useState("");
+  const [user, setUser] = useState(null);
 
   useEffect(() => {
+    async function loadUser() {
+      const u = await getUser();
+      setUser(u);
+    }
+    loadUser();
     apiGet("/equipment").then(setRows).catch(console.error);
   }, []);
 
@@ -40,12 +48,14 @@ export default function EquipmentList() {
           <div className="searchline">
             <input placeholder="Search..." value={q} onChange={(e) => setQ(e.target.value)} />
           </div>
-          <button className="btn btn-primary" onClick={() => nav("/equipment/new")}>New Equipment</button>
+          {canManageEquipment(user) && (
+            <button className="btn btn-primary" onClick={() => nav("/equipment/new")}>New Equipment</button>
+          )}
         </div>
       </div>
 
       <div className="content-wrapper">
-        <Table columns={columns} rows={filtered} onRowClick={(r) => nav(`/equipment/${r.id}`)} />
+        <Table columns={columns} rows={filtered} onRowClick={(r) => canManageEquipment(user) && nav(`/equipment/${r.id}`)} />
       </div>
     </div>
   );

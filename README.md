@@ -46,8 +46,8 @@ npm install
 Create a `.env` file in the `backend` folder:
 
 ```env
-SUPABASE_URL=https://xdrunpmtqbzfrabvwmzr.supabase.co
-SUPABASE_ANON_KEY=sb_publishable_r3OhWFI5Y4E75Ctu2VNywA_16l3bLrK
+SUPABASE_URL=Replace with database url
+SUPABASE_ANON_KEY=replace with the database api
 PORT=5000
 NODE_ENV=development
 FRONTEND_URL=http://localhost:5173
